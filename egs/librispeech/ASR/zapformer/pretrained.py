@@ -113,15 +113,26 @@ import logging
 import math
 from typing import List
 
+# Ascend NPU adaptation: importing the icefall package first installs a
+# torch-based replacement for the parts of k2 used by this script when a
+# real (CPU/CUDA) k2 build is unavailable, so ``import k2`` below works on
+# machines without k2 (e.g. Ascend NPU hosts).
+import icefall  # noqa: F401
 import k2
 import torch
-import torchaudio
+# Ascend NPU adaptation: torchaudio is not required -- soundfile reads the
+# audio and lhotse's Fbank (the same extractor as asr_datamodule.py) computes
+# the features.
+import soundfile as sf  # noqa: E402
 from beam_search import (
     fast_beam_search_one_best,
     greedy_search_batch,
     modified_beam_search,
 )
 from export import num_tokens
+from icefall import npu_compat
+from icefall.utils import str2bool
+from lhotse.features import Fbank, FbankConfig
 from torch.nn.utils.rnn import pad_sequence
 from train import add_model_arguments, get_model, get_params
 
@@ -222,6 +233,26 @@ def get_parser():
         --method is greedy_search.
         """,
     )
+    # Ascend NPU adaptation: static-shape TorchAir compilation of the
+    # encoder (see maybe_compile_encoder below).
+    parser.add_argument(
+        "--torch-compile",
+        type=str2bool,
+        default=False,
+        help="""Compile the encoder with the TorchAir NPU backend
+        (torch.compile, fullgraph, static shape). Inputs are padded to
+        --max-seconds so a single compiled graph is reused; only
+        greedy_search is supported with this option. Requires an NPU
+        device and torchair (import torchair; released with torch_npu).""",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=60.0,
+        help="""Truncate/pad each input file to this many seconds. Used as
+        the fixed padded length when --torch-compile is enabled; 0 disables
+        truncation (eager mode does not need it).""",
+    )
 
     add_model_arguments(parser)
 
@@ -242,13 +273,63 @@ def read_sound_files(
     """
     ans = []
     for f in filenames:
-        wave, sample_rate = torchaudio.load(f)
+        # Ascend NPU adaptation: soundfile instead of torchaudio.load.
+        wave, sample_rate = sf.read(f, dtype="float32", always_2d=True)
         assert (
             sample_rate == expected_sample_rate
         ), f"expected sample rate: {expected_sample_rate}. Given: {sample_rate}"
         # We use only the first channel
-        ans.append(wave[0].contiguous())
+        ans.append(torch.from_numpy(wave[:, 0]).contiguous())
     return ans
+
+
+# ---------------------------------------------------------------------------
+# Ascend NPU adaptation: TorchAir compilation of the encoder.
+#
+# NOTE: torchair must be imported *after* torch_npu (importing torch_npu
+# makes the top-level ``import torchair`` resolvable; icefall.npu_compat,
+# imported above, does that).  Also note that GE initialization imports the
+# CANN ``tbe`` python module, whose path comes from the environment's
+# PYTHONPATH -- do not overwrite PYTHONPATH when launching this script.
+# ---------------------------------------------------------------------------
+
+
+class EncoderWrapper(torch.nn.Module):
+    """Expose ``model.forward_encoder`` as a compilable module."""
+
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.m = model
+
+    def forward(self, x: torch.Tensor, x_lens: torch.Tensor):
+        return self.m.forward_encoder(x, x_lens)
+
+
+def maybe_compile_encoder(
+    model: torch.nn.Module, params, device: torch.device
+):
+    """Optionally compile the encoder with the TorchAir NPU backend.
+
+    ``fullgraph=True`` plus a static padded input shape (all utterances
+    padded to ``--max-seconds``) make the whole encoder a single reusable
+    graph; the decoder/joiner stay eager (they are tiny compared with the
+    encoder and their loop structure does not benefit from compilation).
+    """
+    if not params.torch_compile:
+        return None
+    if device.type != "npu":
+        raise RuntimeError("--torch-compile requires an NPU device (TorchAir)")
+    if params.max_seconds is None or params.max_seconds <= 0:
+        raise ValueError(
+            "--torch-compile requires --max-seconds > 0 (fixed padding length)"
+        )
+    import torchair  # after torch_npu (see note above)
+
+    cfg = torchair.CompilerConfig()
+    backend = torchair.get_npu_backend(compiler_config=cfg)
+    wrapper = EncoderWrapper(model).to(device)
+    logging.info("Compiling encoder with TorchAir backend (fullgraph, static)...")
+    return torch.compile(wrapper, backend=backend, dynamic=False, fullgraph=True)
 
 
 @torch.no_grad()
@@ -271,6 +352,10 @@ def main():
     device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda", 0)
+    elif npu_compat.is_npu_available():
+        # Ascend NPU adaptation.
+        npu_compat.set_device(0)
+        device = torch.device("npu", 0)
 
     logging.info(f"device: {device}")
 
@@ -293,37 +378,29 @@ def main():
     model.to(device)
     model.eval()
 
+    # Ascend NPU adaptation: optionally run the encoder through a
+    # TorchAir-compiled graph (see maybe_compile_encoder).
+    compiled_encoder = maybe_compile_encoder(model, params, device)
+
     logging.info("Constructing Fbank computer")
 
     logging.info(f"Reading sound files: {params.sound_files}")
     waves = read_sound_files(
         filenames=params.sound_files, expected_sample_rate=params.sample_rate
     )
-    waves = [w.to(device) for w in waves]
 
     logging.info("Decoding started")
+    # Ascend NPU adaptation: lhotse's Fbank with the recipe's default
+    # configuration (the same extractor as asr_datamodule.py /
+    # compute_fbank_librispeech.py) instead of torchaudio; the features are
+    # identical to training.
+    extractor = Fbank(FbankConfig(num_mel_bins=params.feature_dim))
     features = []
     for w in waves:
-        feat = torchaudio.compliance.kaldi.fbank(
-            w.unsqueeze(0),
-            num_mel_bins=params.feature_dim,
-            sample_frequency=params.sample_rate,
-            dither=0,
-            snip_edges=False,
-            high_freq=-400,
-        )  # (num_frames, feature_dim)
-        features.append(feat.to(device))
+        feat = extractor.extract(w.numpy(), params.sample_rate)
+        # feat: (num_frames, feature_dim)
+        features.append(torch.from_numpy(feat).to(device))
     feature_lengths = [f.size(0) for f in features]
-
-    features = pad_sequence(features, batch_first=True, padding_value=math.log(1e-10))
-    feature_lengths = torch.tensor(feature_lengths, device=device)
-
-    # model forward
-    encoder_out, encoder_out_lens = model.forward_encoder(features, feature_lengths)
-
-    hyps = []
-    msg = f"Using {params.method}"
-    logging.info(msg)
 
     def token_ids_to_words(token_ids: List[int]) -> str:
         text = ""
@@ -331,39 +408,91 @@ def main():
             text += token_table[i]
         return text.replace("▁", " ").strip()
 
-    if params.method == "fast_beam_search":
-        decoding_graph = k2.trivial_graph(params.vocab_size - 1, device=device)
-        hyp_tokens = fast_beam_search_one_best(
-            model=model,
-            decoding_graph=decoding_graph,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam,
-            max_contexts=params.max_contexts,
-            max_states=params.max_states,
+    hyps = []
+
+    if compiled_encoder is not None:
+        # Ascend NPU adaptation (TorchAir): the compiled graph has a static
+        # shape; process each utterance separately, padded to --max-seconds,
+        # so that a single compiled graph is reused (greedy search only).
+        fixed_len = int(params.max_seconds * 100)
+        msg = "Using TorchAir-compiled encoder with greedy_search"
+        logging.info(msg)
+
+        for feat in features:
+            x_i = feat.unsqueeze(0)
+            l_i = torch.tensor([feat.size(0)], device=device)
+            if x_i.shape[1] > fixed_len:
+                logging.warning(
+                    "input longer than --max-seconds=%ss: truncating",
+                    params.max_seconds,
+                )
+                x_i = x_i[:, :fixed_len]
+                l_i = torch.tensor([fixed_len], device=device)
+            if x_i.shape[1] < fixed_len:
+                x_i = torch.nn.functional.pad(
+                    x_i,
+                    (0, 0, 0, fixed_len - x_i.shape[1]),
+                    value=math.log(1e-10),
+                )
+            if params.causal:
+                l_i = l_i + 30
+                x_i = torch.nn.functional.pad(
+                    x_i, (0, 0, 0, 30), value=math.log(1e-10)
+                )
+            encoder_out, encoder_out_lens = compiled_encoder(x_i, l_i)
+            hyp_tokens = greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+            )
+            hyps.append(token_ids_to_words(hyp_tokens[0]))
+    else:
+        features = pad_sequence(
+            features, batch_first=True, padding_value=math.log(1e-10)
         )
-        for hyp in hyp_tokens:
-            hyps.append(token_ids_to_words(hyp))
-    elif params.method == "modified_beam_search":
-        hyp_tokens = modified_beam_search(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam_size,
+        feature_lengths = torch.tensor(feature_lengths, device=device)
+
+        # model forward
+        encoder_out, encoder_out_lens = model.forward_encoder(
+            features, feature_lengths
         )
 
-        for hyp in hyp_tokens:
-            hyps.append(token_ids_to_words(hyp))
-    elif params.method == "greedy_search" and params.max_sym_per_frame == 1:
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-        )
-        for hyp in hyp_tokens:
-            hyps.append(token_ids_to_words(hyp))
-    else:
-        raise ValueError(f"Unsupported method: {params.method}")
+        msg = f"Using {params.method}"
+        logging.info(msg)
+
+        if params.method == "fast_beam_search":
+            decoding_graph = k2.trivial_graph(params.vocab_size - 1, device=device)
+            hyp_tokens = fast_beam_search_one_best(
+                model=model,
+                decoding_graph=decoding_graph,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=params.beam,
+                max_contexts=params.max_contexts,
+                max_states=params.max_states,
+            )
+            for hyp in hyp_tokens:
+                hyps.append(token_ids_to_words(hyp))
+        elif params.method == "modified_beam_search":
+            hyp_tokens = modified_beam_search(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=params.beam_size,
+            )
+
+            for hyp in hyp_tokens:
+                hyps.append(token_ids_to_words(hyp))
+        elif params.method == "greedy_search" and params.max_sym_per_frame == 1:
+            hyp_tokens = greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+            )
+            for hyp in hyp_tokens:
+                hyps.append(token_ids_to_words(hyp))
+        else:
+            raise ValueError(f"Unsupported method: {params.method}")
 
     s = "\n"
     for filename, hyp in zip(params.sound_files, hyps):

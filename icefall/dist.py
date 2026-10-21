@@ -20,6 +20,8 @@ import os
 import torch
 from torch import distributed as dist
 
+from .npu_compat import dist_backend, set_device
+
 
 def setup_dist(
     rank=None, world_size=None, master_port=None, use_ddp_launch=False, master_addr=None
@@ -35,11 +37,12 @@ def setup_dist(
     if "MASTER_PORT" not in os.environ:
         os.environ["MASTER_PORT"] = "12354" if master_port is None else str(master_port)
 
+    backend = dist_backend()
     if use_ddp_launch is False:
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank)
+        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        set_device(rank)
     else:
-        dist.init_process_group("nccl")
+        dist.init_process_group(backend)
 
 
 def cleanup_dist():

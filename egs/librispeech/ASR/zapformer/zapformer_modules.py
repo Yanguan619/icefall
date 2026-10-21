@@ -24,7 +24,7 @@ from typing import Optional, Tuple, Union, Any
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.cuda.amp import custom_bwd, custom_fwd
+from npu_compat import autocast, custom_bwd, custom_fwd, is_npu_available
 from zapformer_utils import limit_param_value
 
 
@@ -47,16 +47,18 @@ def logaddexp(x: Tensor, y: Tensor) -> Tensor:
     #
     # torch.logaddexp() works for both torch.jit.script() and
     # torch.jit.trace() but it causes errors for ONNX export.
+    # It is also rejected by the Ascend NPU graph compiler (TorchAir /
+    # ACG, "GRAPH feature not supported"), so the eager / traced / NPU
+    # path uses the numerically-equivalent `max + log1p(exp(-|x-y|))`
+    # formulation instead.
     #
     if torch.jit.is_scripting():
         # Note: We cannot use torch.jit.is_tracing() here as it also
         # matches torch.onnx.export().
         return torch.logaddexp(x, y)
-    elif torch.onnx.is_in_onnx_export():
-        return logaddexp_onnx(x, y)
     else:
-        # for torch.jit.trace()
-        return torch.logaddexp(x, y)
+        # torch.jit.trace() / dynamo (torch.compile) / eager / NPU graph.
+        return logaddexp_onnx(x, y)
 
 
 # all arg tensors except x are scalars.
@@ -152,7 +154,7 @@ class CausalSequenceNormFunction(torch.autograd.Function):
     def backward(ctx, ans_grad: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         x, offset, scale, ballast_rms, ballast_frames = ctx.saved_tensors
 
-        with torch.amp.autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             x = x.to(torch.float32).detach().requires_grad_()
             offset = offset.to(torch.float32).detach().requires_grad_()
             scale = scale.to(torch.float32).detach().requires_grad_()
@@ -192,7 +194,7 @@ class SequenceNormFunction(torch.autograd.Function):
     def backward(ctx, ans_grad: Tensor) -> Tensor:
         x, offset, scale = ctx.saved_tensors
 
-        with torch.amp.autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             x = x.to(torch.float32).detach().requires_grad_()
             offset = offset.to(torch.float32).detach().requires_grad_()
             scale = scale.to(torch.float32).detach().requires_grad_()
@@ -256,7 +258,7 @@ class CausalSequenceNorm(torch.nn.Module):
             x, offset, scale, ballast_rms, ballast_frames,
         )
 
-        if random.random() < 0.002:
+        if torch.is_grad_enabled() and random.random() < 0.002:
             x_rms = (x ** 2).mean().sqrt()
             ans_rms = (ans ** 2).mean().sqrt()
             logging.info(f"name={self.name}: x_rms={x_rms}, ans_rms={ans_rms}, scale={self.scale.item()}, offset={self.offset.item()}, ballast_rms={self.ballast_rms.item()}, ballast_frames*100={100*self.ballast_frames.item()}")
@@ -323,7 +325,7 @@ class SequenceNorm(torch.nn.Module):
             x, offset, scale, mask,
         )
 
-        if random.random() < 0.002:
+        if torch.is_grad_enabled() and random.random() < 0.002:
             x_rms = (x ** 2).mean().sqrt()
             ans_rms = (ans ** 2).mean().sqrt()
             logging.info(f"name={self.name}: x_rms={x_rms}, ans_rms={ans_rms}, scale={self.scale.item()}, offset={self.offset.item()}")
@@ -361,7 +363,7 @@ class RmsNormFunction(torch.autograd.Function):
     def backward(ctx, ans_grad: Tensor) -> Tensor:
         x, eps, scale = ctx.saved_tensors
 
-        with torch.amp.autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             x, eps, scale = x.to(torch.float32), eps.to(torch.float32), scale.to(torch.float32)
             x, eps, scale = x.detach(), eps.detach(), scale.detach()
 
@@ -410,7 +412,7 @@ class RmsNorm(torch.nn.Module):
             x, eps, scale,
         )
 
-        if random.random() < 0.002:
+        if torch.is_grad_enabled() and random.random() < 0.002:
             x_rms = (x ** 2).mean().sqrt()
             ans_rms = (ans ** 2).mean().sqrt()
             logging.info(f"name={self.name}: x_rms={x_rms}, ans_rms={ans_rms}, eps={eps.item()}, scale={scale.item()}")
@@ -491,7 +493,7 @@ class OrthogonalPenaltyFunction(torch.autograd.Function):
                 prod.backward(gradient=prod * penalty_scale)
 
 
-                do_print = random.random() < 0.002
+                do_print = torch.is_grad_enabled() and random.random() < 0.002
                 if do_print:
                     # we print a normalized version of the loss, by dividing by the
                     # number of rows.
@@ -568,7 +570,7 @@ class ScaleLimiterFunction(torch.autograd.Function):
     def backward(ctx, x_grad: Tensor):
         x, = ctx.saved_tensors
         with torch.enable_grad():
-            with torch.amp.autocast('cuda', enabled=False):
+            with autocast(enabled=False):
                 x = x.to(torch.float)
                 x = x.detach()
                 x.requires_grad = True
@@ -577,7 +579,7 @@ class ScaleLimiterFunction(torch.autograd.Function):
 
                 excess = (rms / ctx.max_rms - 1.).relu().mean()
 
-                if random.random() < 0.002:
+                if torch.is_grad_enabled() and random.random() < 0.002:
                     logging.info(
                         f"ScaleLimiter: name={ctx.name}, max_rms={ctx.max_rms}, "
                         f"rms={rms.mean().item()}, excess={excess.item()}, "
@@ -626,7 +628,7 @@ class CorrelationLimiterFunction(torch.autograd.Function):
         (batch_size, seq_len, num_channels) = x.shape
 
         with torch.enable_grad():
-            with torch.amp.autocast('cuda', enabled=False):
+            with autocast(enabled=False):
                 x = x.to(torch.float)
                 x = x.detach()
                 x.requires_grad = True
@@ -668,7 +670,7 @@ class CorrelationLimiterFunction(torch.autograd.Function):
                 correlation = (S1 * S2).mean()
                 loss = (correlation - ctx.limit).relu()
 
-                if random.random() < 0.001:
+                if torch.is_grad_enabled() and random.random() < 0.001:
                     logging.info(
                         f"CorrelationLimiter: name={ctx.name}, loss_scale={aux_loss_scale}, correlation={correlation}, limit={ctx.limit}, loss={loss}"
                     )
@@ -728,6 +730,12 @@ class Identity(torch.nn.Module):
 
 
 def torch_compile(fn, *args, **kwargs):
+    # ``torch.compile`` (with the inductor "shape_padding" options used by the
+    # upstream recipe) is not supported on Ascend NPUs, so we fall back to the
+    # eager implementation there.  The compiled functions here are small
+    # elementwise activations, so eager mode costs very little.
+    if is_npu_available():
+        return fn
     if hasattr(torch, 'compile'):
         fn = torch.compile(fn, *args, **kwargs, dynamic=True, options={"shape_padding": True, "force_shape_pad": True})
     return fn

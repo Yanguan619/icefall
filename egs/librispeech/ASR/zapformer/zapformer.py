@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from encoder_interface import EncoderInterface
+from npu_compat import autocast
 from zapformer_modules import (
     ActivationAndLinear,
     CausalSequenceNorm,
@@ -393,9 +394,12 @@ class Zapformer(EncoderInterface):
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             c = t // chunk_size
         else:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                c = t // chunk_size
+            # NOTE: the upstream code wrapped this in
+            # ``warnings.catch_warnings()/simplefilter("ignore")``, but the
+            # floor-division emits no warning on modern torch versions and the
+            # wrapper makes the encoder untraceable for torch.compile (dynamo
+            # refuses ``_warnings._filters_mutated``).
+            c = t // chunk_size
         src_c = c
         tgt_c = c.unsqueeze(-1)
 
@@ -1184,7 +1188,7 @@ class MultiheadRelPosGatedSelfAttention(nn.Module):
 
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             pass
-        elif random.random() < 0.001:
+        elif torch.is_grad_enabled() and random.random() < 0.001:
             self._print_attn_entropy(attn_weights)
 
         vg = self.vg_in_proj(x_vg)
@@ -1338,7 +1342,7 @@ class MultiheadRelPosGatedSelfAttention(nn.Module):
         (num_heads, batch_size, seq_len, seq_len) = attn_weights.shape
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=False):
+            with autocast(enabled=False):
                 attn_weights = attn_weights.to(torch.float32)
                 attn_weights_entropy = (
                     -((attn_weights + 1.0e-20).log() * attn_weights)
@@ -1374,7 +1378,7 @@ class PenalizeLargeAttentionScores(torch.autograd.Function):
         attn_scores, = ctx.saved_tensors
         mask = ctx.mask
         (num_heads, batch_size, seq_len, _) = attn_scores.shape
-        with torch.amp.autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             attn_scores = attn_scores.to(torch.float)
             attn_scores = attn_scores.detach()
             # attn_scores: (head, batch, query_time, key_time)
@@ -1729,7 +1733,7 @@ class FftConv(nn.Module):
         rounded_seq_len = power_of_two * ((seq_len + power_of_two - 1) // power_of_two)
 
 
-        with torch.amp.autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             # do it in float32 because non power of two seq_len is not supported in half precision.
             x = torch.fft.rfft(x.to(torch.float32), dim=0, n=rounded_seq_len)
             # x: (num_freqs, batch_size, num_channels)
@@ -1835,7 +1839,7 @@ def fourier_conv(x: Tensor, y: Tensor):
     T = max(x.shape[0], y.shape[0])
     T_out = min(x.shape[0], y.shape[0])
 
-    with torch.amp.autocast('cuda', enabled=False):
+    with autocast(enabled=False):
         x = x.to(torch.float)
         y = y.to(torch.float)
         X = torch.fft.rfft(x, dim=0, n=T)

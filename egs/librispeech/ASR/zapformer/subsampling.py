@@ -256,9 +256,10 @@ class Conv2dSubsampling(nn.Module):
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             x_lens = (x_lens - 7) // 2
         else:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                x_lens = (x_lens - 7) // 2
+            # no warning is emitted by this floor-division on modern torch; the
+            # ``warnings.catch_warnings()`` wrapper made the encoder
+            # untraceable for torch.compile (see zapformer.py).
+            x_lens = (x_lens - 7) // 2
 
         key_padding_mask = torch.arange(0, x.shape[1], device=x.device) >= x_lens.unsqueeze(-1)
 
@@ -304,9 +305,10 @@ class Conv2dSubsampling(nn.Module):
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             x_lens = (x_lens - 7) // 2
         else:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                x_lens = (x_lens - 7) // 2
+            # no warning is emitted by this floor-division on modern torch; the
+            # ``warnings.catch_warnings()`` wrapper made the encoder
+            # untraceable for torch.compile (see zapformer.py).
+            x_lens = (x_lens - 7) // 2
 
         return 0.15 * x, x_lens, cache
 

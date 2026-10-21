@@ -1478,7 +1478,12 @@ def make_pad_mask(
             [False, False, False, False, False]])
     """
     assert lengths.ndim == 1, lengths.ndim
-    max_len = max(max_len, lengths.max())
+    # When an explicit ``max_len`` is given (e.g. the static padded sequence
+    # length during torch.compile / export) it is used directly, so no
+    # data-dependent scalar is extracted from the tensor.  Otherwise it is
+    # derived from ``lengths.max()`` (the eager / training path).
+    if max_len == 0:
+        max_len = int(lengths.max().item())
     n = lengths.size(0)
     seq_range = torch.arange(0, max_len, device=lengths.device)
     expanded_lengths = seq_range.unsqueeze(0).expand(n, max_len)

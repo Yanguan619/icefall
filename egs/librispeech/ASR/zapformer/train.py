@@ -60,6 +60,11 @@ from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
 
+# Importing ``icefall`` installs a torch-based replacement for the small part of
+# the ``k2`` API used by the training path when k2 is unavailable (Ascend NPU).
+# It must happen before ``import k2`` below.
+import icefall  # noqa: F401  isort:skip
+
 import k2
 import sentencepiece as spm
 import torch
@@ -95,7 +100,16 @@ SchedulerType = "VariableCombinedLRScheduler"
 from torch.optim.lr_scheduler import LambdaLR
 from subsampling import Conv2dSubsampling
 from torch import Tensor
-from torch.cuda.amp import GradScaler
+from npu_compat import (
+    GradScaler,
+    autocast,
+    get_device,
+    get_rng_state,
+    has_accelerator,
+    is_bf16_supported,
+    max_memory_allocated,
+    set_device,
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from zapformer import Zapformer
@@ -1003,13 +1017,13 @@ def compute_loss(
     y = k2.RaggedTensor(y)
 
     if specaug is not None:
-        with torch.amp.autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             features = specaug(features.to(torch.float), feature_lens)
 
 
     if batch_idx_train % 50 == 0:
         logging.info(
-            f"rng_state={torch.cuda.get_rng_state()}, features-sum={features.sum()}"
+            f"rng_state={get_rng_state()}, features-sum={features.sum()}"
         )
 
     with torch.set_grad_enabled(is_training):
@@ -1176,9 +1190,7 @@ def train_one_epoch(
         batch_size = len(batch["supervisions"]["text"])
 
         try:
-            with torch.amp.autocast('cuda',
-                enabled=params.use_autocast, dtype=params.dtype
-            ):
+            with autocast(enabled=params.use_autocast, dtype=params.dtype):
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
@@ -1318,7 +1330,7 @@ def train_one_epoch(
             model.train()
             logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
             logging.info(
-                f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
+                f"Maximum memory allocated so far is {max_memory_allocated()//1000000}MB"
             )
             if tb_writer is not None:
                 valid_info.write_summary(
@@ -1365,10 +1377,9 @@ def run(rank, world_size, args):
     else:
         tb_writer = None
 
-    device = torch.device("cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
-        device = torch.device("cuda", rank)
+    if has_accelerator():
+        set_device(rank)
+    device = get_device(rank)
     logging.info(f"Device: {device}")
 
     sp = spm.SentencePieceProcessor()
@@ -1389,7 +1400,7 @@ def run(rank, world_size, args):
             )
 
     if params.use_bf16:  # amp + bf16
-        assert torch.cuda.is_bf16_supported(), "Your GPU does not support bf16!"
+        assert is_bf16_supported(), "The device does not support bf16!"
         assert not params.use_fp16, "You can only use either fp16 or bf16"
         params.dtype = torch.bfloat16
         params.use_autocast = True
@@ -1425,7 +1436,10 @@ def run(rank, world_size, args):
     model.to(device)
     if world_size > 1:
         logging.info("Using DDP")
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        if has_accelerator():
+            model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        else:
+            model = DDP(model, find_unused_parameters=True)
 
 
     # the LRs will be 1.0, we'll fix them later.
@@ -1760,9 +1774,7 @@ def scan_pessimistic_batches_for_oom(
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
         try:
-            with torch.amp.autocast('cuda',
-                enabled=params.use_autocast, dtype=params.dtype
-            ):
+            with autocast(enabled=params.use_autocast, dtype=params.dtype):
                 loss, _ = compute_loss(
                     params=params,
                     model=model,
@@ -1784,7 +1796,7 @@ def scan_pessimistic_batches_for_oom(
             display_and_save_batch(batch, params=params, sp=sp)
             raise
         logging.info(
-            f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
+            f"Maximum memory allocated so far is {max_memory_allocated()//1000000}MB"
         )
 
 

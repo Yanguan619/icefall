@@ -103,6 +103,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Ascend NPU adaptation: importing the icefall package first installs a
+# torch-based replacement for the parts of k2 used by this script when a
+# real (CPU/CUDA) k2 build is unavailable, so ``import k2`` below works on
+# machines without k2 (e.g. Ascend NPU hosts).
+import icefall  # noqa: F401
 import k2
 import sentencepiece as spm
 import torch
@@ -125,7 +130,7 @@ from beam_search import (
 from lhotse import set_caching_enabled
 from train import add_model_arguments, get_model, get_params
 
-from icefall import ContextGraph, LmScorer, NgramLm
+from icefall import ContextGraph, LmScorer, NgramLm, npu_compat
 from icefall.checkpoint import (
     average_checkpoints,
     average_checkpoints_with_averaged_model,
@@ -961,6 +966,10 @@ def main():
     device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda", 0)
+    elif npu_compat.is_npu_available():
+        # Ascend NPU adaptation.
+        npu_compat.set_device(0)
+        device = torch.device("npu", 0)
 
     logging.info(f"Device: {device}")
 

@@ -1,5 +1,24 @@
 # isort:skip_file
 
+import os as _os
+
+# ``k2`` only ships CPU / CUDA kernels -- there is no Ascend NPU backend.  When
+# k2 cannot be imported (the usual situation on NPU), or when explicitly
+# requested, install a minimal torch-based replacement for the part of the k2
+# API used by the training / fine-tuning path.  Set ``ICEFALL_USE_TORCH_K2=1``
+# to force it even when a real k2 installation is present.
+_use_torch_k2 = _os.environ.get("ICEFALL_USE_TORCH_K2", "0") == "1"
+if not _use_torch_k2:
+    try:  # use the real k2 package when it is available (CPU / CUDA builds)
+        import k2 as _k2  # noqa: F401
+    except ImportError:
+        _use_torch_k2 = True
+
+if _use_torch_k2:
+    from . import k2_compat as _k2_compat
+
+    _k2_compat.install()
+
 from . import checkpoint, decode, dist, env, utils
 
 from .byte_utils import (

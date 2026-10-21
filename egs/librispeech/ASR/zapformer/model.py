@@ -18,11 +18,14 @@
 
 from typing import Optional, Tuple
 
+import icefall  # noqa: F401  isort:skip  (installs the torch k2 shim on NPU)
+
 import k2
 import torch
 import torch.nn as nn
 from torch import Tensor
 from encoder_interface import EncoderInterface
+from npu_compat import autocast
 
 from zapformer_modules import ScaledLinear
 from icefall.utils import add_sos, make_pad_mask
@@ -149,7 +152,10 @@ class AsrModel(nn.Module):
         x, x_lens = self.encoder_embed(x, x_lens, aux_loss_scale=aux_loss_scale)
         # logging.info(f"Memory allocated after encoder_embed: {torch.cuda.memory_allocated() // 1000000}M")
 
-        src_key_padding_mask = make_pad_mask(x_lens)   # (N, T)
+        # ``max_len`` is the static, padded sequence length: it avoids the
+        # data-dependent ``lengths.max()`` that the graph compiler (TorchAir)
+        # cannot lower (see icefall/utils.py:make_pad_mask).
+        src_key_padding_mask = make_pad_mask(x_lens, max_len=x.shape[1])   # (N, T)
 
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
 
@@ -157,7 +163,10 @@ class AsrModel(nn.Module):
                                                      aux_loss_scale=aux_loss_scale)
 
         encoder_out = encoder_out.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
-        assert torch.all(encoder_out_lens > 0), (x_lens, encoder_out_lens)
+        if not torch.compiler.is_compiling():
+            # Skip this data-dependent assertion during torch.compile graph
+            # capture (it is a safety check only; the values are unchanged).
+            assert torch.all(encoder_out_lens > 0), (x_lens, encoder_out_lens)
 
 
         return encoder_out, encoder_out_lens
@@ -264,7 +273,7 @@ class AsrModel(nn.Module):
         # if self.training and random.random() < 0.25:
         #    am = penalize_abs_values_gt(am, 30.0, 1.0e-04)
 
-        with torch.amp.autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
                 lm=lm.float(),
                 am=am.float(),
@@ -299,7 +308,7 @@ class AsrModel(nn.Module):
         # prior to do_rnnt_pruning (this is an optimization for speed).
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
-        with torch.amp.autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             pruned_loss = k2.rnnt_loss_pruned(
                 logits=logits.float(),
                 symbols=y_padded,
@@ -369,6 +378,9 @@ class AsrModel(nn.Module):
         encoder_out, encoder_out_lens = self.forward_encoder(x, x_lens,
                                                              aux_loss_scale=aux_loss_scale)
 
+        # Move the labels to the device up-front: the CTC head and the
+        # attention-decoder head below also consume them directly.
+        y = y.to(device)
         row_splits = y.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
 
@@ -377,7 +389,7 @@ class AsrModel(nn.Module):
             simple_loss, pruned_loss = self.forward_transducer(
                 encoder_out=encoder_out,
                 encoder_out_lens=encoder_out_lens,
-                y=y.to(device),
+                y=y,
                 y_lens=y_lens,
                 prune_range=prune_range,
                 am_scale=am_scale,

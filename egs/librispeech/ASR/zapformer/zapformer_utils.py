@@ -25,7 +25,7 @@ import k2
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.cuda.amp import custom_bwd, custom_fwd
+from npu_compat import autocast, custom_bwd, custom_fwd, get_autocast_dtype, is_autocast_enabled
 
 
 
@@ -40,8 +40,8 @@ class SoftmaxFunction(torch.autograd.Function):
         # if x dtype is float16, x.softmax() returns a float32 because
         # (presumably) that op does not support float16, and autocast
         # is enabled.
-        if torch.is_autocast_enabled():
-            ans = ans.to(torch.get_autocast_gpu_dtype())
+        if is_autocast_enabled():
+            ans = ans.to(get_autocast_dtype())
         ctx.save_for_backward(ans)
         ctx.x_dtype = x.dtype
         ctx.dim = dim
@@ -50,7 +50,7 @@ class SoftmaxFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, ans_grad: Tensor):
         (ans,) = ctx.saved_tensors
-        with torch.amp.autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             ans_grad = ans_grad.to(torch.float32)
             ans = ans.to(torch.float32)
             x_grad = ans_grad * ans
@@ -104,7 +104,7 @@ class WithLoss(torch.autograd.Function):
     def forward(ctx, x: Tensor, y: Tensor, name: str):
         ctx.y_shape = y.shape
         ctx.dtype = y.dtype
-        if random.random() < 0.002 and name is not None:
+        if torch.is_grad_enabled() and random.random() < 0.002 and name is not None:
             loss_sum = y.sum().item()
             logging.info(f"WithLoss: name={name}, loss-sum={loss_sum:.3e}")
         return x
